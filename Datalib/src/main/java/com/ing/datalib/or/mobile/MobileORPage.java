@@ -1,0 +1,285 @@
+
+package com.ing.datalib.or.mobile;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+
+import javax.swing.tree.TreeNode;
+import javax.swing.tree.TreePath;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlElementWrapper;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
+import com.ing.datalib.or.common.ORPageInf;
+import com.ing.datalib.or.common.ORUtils;
+import com.ing.datalib.or.common.ObjectGroup;
+import com.ing.datalib.or.mobile.MobileOR.ORScope;
+
+/**
+ * Represents a single mobile object inside a MobileOR page, containing a collection of
+ * OR attributes, frame information, and references to its parent object group.
+ * Supports attribute editing, table model operations, cloning, renaming,
+ * and object repository persistence updates.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class MobileORPage implements ORPageInf<MobileORObject, MobileOR> {
+
+    @JacksonXmlProperty(isAttribute = true, localName = "ref")
+    private String name;
+
+    @JacksonXmlProperty(isAttribute = true)
+    private String packageName;
+
+    @JacksonXmlProperty(localName = "ObjectGroup")
+    @JacksonXmlElementWrapper(useWrapping = false, localName = "ObjectGroup")
+    private List<ObjectGroup<MobileORObject>> objectGroups;
+
+    @JsonIgnore
+    private MobileOR root;
+    
+    @JacksonXmlProperty(isAttribute = true, localName = "source")
+    private ORScope source = ORScope.PROJECT;
+
+    public MobileORPage() {
+        this.objectGroups = new ArrayList<>();
+    }
+
+    public MobileORPage(String name, MobileOR root) {
+        this.name = name;
+        this.root = root;
+        this.packageName = "";
+        this.objectGroups = new ArrayList<>();
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    @Override
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getPackageName() {
+        return packageName;
+    }
+
+    public void setPackageName(String packageName) {
+        this.packageName = packageName;
+    }
+
+    @Override
+    public List<ObjectGroup<MobileORObject>> getObjectGroups() {
+        return objectGroups;
+    }
+
+    @Override
+    public void setObjectGroups(List<ObjectGroup<MobileORObject>> objectGroups) {
+        this.objectGroups = objectGroups;
+        for (ObjectGroup<MobileORObject> objectGroup : objectGroups) {
+            objectGroup.setParent(this);
+        }
+    }
+
+    @JsonIgnore
+    @Override
+    public void removeFromParent() {
+        root.setSaved(false);
+        root.getPages().remove(this);
+        root.getObjectRepository().deleteMobilePageYaml(getName(), root.getScope());
+    }
+
+    @JsonIgnore
+    @Override
+    public ObjectGroup<MobileORObject> getObjectGroupByName(String groupName) {
+        for (ObjectGroup<MobileORObject> group : objectGroups) {
+            if (group.getName().equalsIgnoreCase(groupName)) {
+                return group;
+            }
+        }
+        return null;
+    }
+
+    @JsonIgnore
+    @Override
+    public ObjectGroup<MobileORObject> addObjectGroup() {
+        String oName = "MObjectGroup";
+        int i = 0;
+        String objectName;
+        do {
+            objectName = oName + i++;
+        } while (getObjectGroupByName(objectName) != null);
+
+        return addObjectGroup(objectName);
+    }
+
+    @JsonIgnore
+    @Override
+    public ObjectGroup<MobileORObject> addObjectGroup(String groupName) {
+        if (getObjectGroupByName(groupName) == null) {
+            ObjectGroup<MobileORObject> group = new ObjectGroup<>(groupName, this);
+            objectGroups.add(group);
+            // Only create folder for non-YAML formats
+            if (root.getObjectRepository() == null || !root.getObjectRepository().isUsingYamlFormat()) {
+                new File(group.getRepLocation()).mkdirs();
+            }
+            group.addObject(groupName);
+            root.setSaved(false);
+            
+            // Auto-save for YAML format
+            if (root.getObjectRepository() != null 
+                && root.getObjectRepository().isUsingYamlFormat()) {
+                root.getObjectRepository().saveMobilePageNow(this);
+            }
+            return group;
+        }
+        return null;
+    }
+
+    @JsonIgnore
+    @Override
+    public MobileORObject getNewObject(String objectName, ObjectGroup<MobileORObject> group) {
+        return new MobileORObject(objectName, group);
+    }
+
+    @JsonIgnore
+    @Override
+    public MobileORObject addObject() {
+        String oName = "MObject";
+        int i = 0;
+        String objectName;
+        do {
+            objectName = oName + i++;
+        } while (getObjectGroupByName(objectName) != null);
+
+        return addObject(objectName);
+    }
+
+    @JsonIgnore
+    @Override
+    public MobileORObject addObject(String objectName) {
+        ObjectGroup<MobileORObject> group = addObjectGroup(objectName);
+        if (group != null) {
+            return group.getObjects().get(0);
+        }
+        return null;
+    }
+
+    @JsonIgnore
+    @Override
+    public void deleteObjectGroup(String groupName) {
+        ObjectGroup<MobileORObject> group = getObjectGroupByName(groupName);
+        if (group != null) {
+            objectGroups.remove(group);
+            root.setSaved(false);
+        }
+    }
+
+    @JsonIgnore
+    @Override
+    public TreeNode getChildAt(int i) {
+        if (objectGroups.get(i).getChildCount() > 1) {
+            return objectGroups.get(i);
+        }
+        return objectGroups.get(i).getChildAt(0);
+    }
+
+    @JsonIgnore
+    @Override
+    public int getChildCount() {
+        return objectGroups == null ? 0
+                : objectGroups.size();
+    }
+
+    @JsonIgnore
+    @Override
+    public MobileOR getParent() {
+        return root;
+    }
+
+    @JsonIgnore
+    @Override
+    public int getIndex(TreeNode tn) {
+        return objectGroups.indexOf(tn);
+    }
+
+    @JsonIgnore
+    @Override
+    public boolean getAllowsChildren() {
+        return true;
+    }
+
+    @JsonIgnore
+    @Override
+    public boolean isLeaf() {
+        return getChildCount() == 0;
+    }
+
+    @JsonIgnore
+    @Override
+    public Enumeration children() {
+        return Collections.enumeration(objectGroups);
+    }
+
+    @JsonIgnore
+    @Override
+    public MobileOR getRoot() {
+        return root;
+    }
+
+    @JsonIgnore
+    @Override
+    public void setRoot(MobileOR root) {
+        this.root = root;
+    }
+
+    @Override
+    public String toString() {
+        return name;
+    }
+
+    @JsonIgnore
+    @Override
+    public TreeNode[] getPath() {
+        return (TreeNode[]) ORUtils.getPath(this).getPath();
+    }
+
+    @JsonIgnore
+    @Override
+    public TreePath getTreePath() {
+        return ORUtils.getPath(this);
+    }
+
+    @Override
+    public Boolean rename(String newName) {
+        getRoot()
+            .getObjectRepository()
+            .renamePage(this, newName);
+        return true;
+    }
+
+    @JsonIgnore
+    @Override
+    public String getRepLocation() {
+        return getParent().getRepLocation() + File.separator + getName();
+    }
+
+    @JsonIgnore
+    @Override
+    public void sort() {
+        ORUtils.sort(this);
+    }
+    
+    public ORScope getSource() {
+        return source;
+    }
+
+    public void setSource(ORScope source) {
+        this.source = source;
+    }
+}

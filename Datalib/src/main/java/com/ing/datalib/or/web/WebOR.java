@@ -1,0 +1,301 @@
+
+package com.ing.datalib.or.web;
+
+import com.ing.datalib.or.ObjectRepository;
+import com.ing.datalib.or.common.ORRootInf;
+import com.ing.datalib.or.common.ORUtils;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlElementWrapper;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+import javax.swing.tree.TreeNode;
+
+/**
+ * Represents the Web Object Repository (WebOR), containing pages and their objects,
+ * along with metadata such as scope, type, associated projects, and save state.
+ * Provides page management, tree navigation, sorting, and repository integration.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+@JacksonXmlRootElement(localName = "Root")
+public class WebOR implements ORRootInf<WebORPage> {
+
+    public final static List<String> OBJECT_PROPS
+            = new ArrayList<>(Arrays.asList(
+                    "Role",
+                    "Text",
+                    "Label",
+                    "Placeholder",
+                    "xpath",
+                    "css",
+                    "AltText",
+                    "Title",
+                    "TestId",
+                    "ChainedLocator"));
+
+    @JacksonXmlProperty(isAttribute = true, localName = "ref")
+    private String name;
+
+    @JacksonXmlProperty(localName = "Page")
+    @JacksonXmlElementWrapper(useWrapping = false, localName = "Page")
+    private List<WebORPage> pages;
+
+    @JacksonXmlProperty(isAttribute = true)
+    private String type;
+    
+    @JacksonXmlProperty(isAttribute = true)
+    private ORScope scope = ORScope.PROJECT;
+    
+    @JacksonXmlElementWrapper(localName = "projects")
+    @JacksonXmlProperty(localName = "project")
+    private List<String> projects = new ArrayList<>();
+
+    @JsonIgnore
+    private ObjectRepository objectRepository;
+
+    @JsonIgnore
+    private Boolean saved = true;
+    
+    @JsonIgnore
+    private String repLocationOverride;
+
+    public WebOR() {
+        this.pages = new ArrayList<>();
+    }
+
+    public WebOR(String name) {
+        this.name = name;
+        this.type = "OR";
+        this.pages = new ArrayList<>();
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    @Override
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    @Override 
+    public List<WebORPage> getPages() {
+        return pages;
+    }
+
+    @Override
+    public void setPages(List<WebORPage> pages) {
+        this.pages = pages;
+        for (WebORPage page : pages) {
+            page.setRoot(this);
+            if (page.getSource() == null || page.getSource().isBlank()) {
+                page.setSource(isShared() ? "SHARED" : "PROJECT");
+            }
+        }
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    public void setType(String type) {
+        this.type = type;
+    }
+
+    @JsonIgnore
+    @Override
+    public WebORPage getPageByName(String pageName) {
+        for (WebORPage page : pages) {
+            if (page.getName().equalsIgnoreCase(pageName)) {
+                return page;
+            }
+        }
+        return null;
+    }
+
+    @JsonIgnore
+    public WebORPage getPageByTitle(String title) {
+        for (WebORPage page : pages) {
+            if (page.getTitle().equals(title)) {
+                return page;
+            }
+        }
+        return null;
+    }
+
+    @JsonIgnore
+    @Override
+    public WebORPage addPage() {
+        String pName = "WPage";
+        int i = 0;
+        String pageName;
+        do {
+            pageName = pName + i++;
+        } while (getPageByName(pageName) != null);
+
+        return addPage(pageName);
+    }
+
+    @JsonIgnore
+    @Override
+    public WebORPage addPage(String pageName) {
+        if (getPageByName(pageName) == null) {
+            WebORPage page = new WebORPage(pageName, this);
+            pages.add(page);
+            page.setSource(isShared() ? "SHARED" : "PROJECT");
+            // Only create folder for non-YAML formats
+            if (objectRepository == null || !objectRepository.isUsingYamlFormat()) {
+                new File(page.getRepLocation()).mkdirs();
+            }
+            setSaved(false);
+            
+            // Auto-save for YAML format
+            if (objectRepository != null && objectRepository.isUsingYamlFormat()) {
+                objectRepository.saveWebPageNow(page);
+            }
+            return page;
+        }
+        return null;
+    }
+
+    @JsonIgnore
+    @Override
+    public void deletePage(String pageName) {
+        WebORPage page = getPageByName(pageName);
+        if (page != null) {
+            pages.remove(page);
+            setSaved(false);
+        }
+    }
+
+    @JsonIgnore
+    @Override
+    public void setObjectRepository(ObjectRepository objRep) {
+        this.objectRepository = objRep;
+    }
+
+    @JsonIgnore
+    @Override
+    public ObjectRepository getObjectRepository() {
+        return objectRepository;
+    }
+
+    @JsonIgnore
+    @Override
+    public TreeNode getChildAt(int i) {
+        return pages.get(i);
+    }
+
+    @JsonIgnore
+    @Override
+    public int getChildCount() {
+        return pages == null ? 0
+                : pages.size();
+    }
+
+    @JsonIgnore
+    @Override
+    public TreeNode getParent() {
+        return null;
+    }
+
+    @JsonIgnore
+    @Override
+    public int getIndex(TreeNode tn) {
+        return pages.indexOf(tn);
+    }
+
+    @JsonIgnore
+    @Override
+    public boolean getAllowsChildren() {
+        return true;
+    }
+
+    @JsonIgnore
+    @Override
+    public boolean isLeaf() {
+        return getChildCount() == 0;
+    }
+
+    @JsonIgnore
+    @Override
+    public Enumeration children() {
+        return Collections.enumeration(pages);
+    }
+
+    @Override
+    public String toString() {
+        return name;
+    }
+
+    @JsonIgnore
+    @Override
+    public Boolean isSaved() {
+        return saved;
+    }
+
+    @JsonIgnore
+    @Override
+    public void setSaved(Boolean saved) {
+        this.saved = saved;
+    }
+
+    @JsonIgnore
+    @Override
+    public TreeNode[] getPath() {
+        return new TreeNode[]{this};
+    }
+
+    @JsonIgnore
+    public void setRepLocationOverride(String path) {
+        this.repLocationOverride = path;
+    }
+
+    @JsonIgnore
+    @Override
+    public String getRepLocation() {
+        return repLocationOverride != null
+            ? repLocationOverride
+            : getObjectRepository().getORRepLocation();
+    }
+
+    @JsonIgnore
+    @Override
+    public void sort() {
+        ORUtils.sort(this);
+    }
+    
+    public enum ORScope { 
+        PROJECT, SHARED 
+    }
+
+    @JsonIgnore
+    public ORScope getScope() { 
+        return scope; 
+    }
+    
+    public void setScope(ORScope scope) { 
+        this.scope = scope; 
+    }
+
+    @JsonIgnore
+    public boolean isShared() { 
+        return scope == ORScope.SHARED; 
+    }
+    
+    public List<String> getSharedProjects() {
+        return isShared() ? projects : Collections.emptyList();
+    }
+
+    public void setSharedProjects(List<String> projects) {
+        this.projects = projects;
+    }
+}

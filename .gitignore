@@ -1,0 +1,44 @@
+# Compiled class file
+*.class
+
+# Log file
+*.log
+
+# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+hs_err_pid*
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+
+# NPM
+node_modules/
+npm-debug.log
+
+# Release
+/Dist/release
+/Dist/release/**
+
+#Plugins
+/Resources/Plugins/**
+
+# IDE Generated Files
+nbproject
+nbactions*.xml
+nb-configuration.xml
+.settings/
+.classpath
+.idea/
+.project
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# other files
+recent.items
+
+.vscode/
