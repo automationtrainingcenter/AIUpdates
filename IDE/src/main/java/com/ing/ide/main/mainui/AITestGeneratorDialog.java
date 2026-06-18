@@ -992,6 +992,12 @@ public class AITestGeneratorDialog extends JFrame {
 
         currentAgent = new AITestGenerationAgent(apiKey, model, npxPath);
 
+        List<String> existingReusables = detectExistingReusables(projectLocation);
+        if (!existingReusables.isEmpty()) {
+            appendLog("Existing reusable scenarios detected (will not be regenerated): "
+                    + String.join(", ", existingReusables));
+        }
+
         try {
             boolean isAzureMode = azureRadio.isSelected();
             io.reactivex.rxjava3.core.Flowable<Event> events;
@@ -1007,7 +1013,8 @@ public class AITestGeneratorDialog extends JFrame {
                     return;
                 }
                 appendLog("Mode: Azure Test Plan ID=" + planId);
-                events = currentAgent.generateFromAzure(azureUrl, azurePat, azureProj, planId, appUrl);
+                events = currentAgent.generateFromAzure(azureUrl, azurePat, azureProj, planId, appUrl,
+                        existingReusables);
             } else {
                 String prompt = promptArea.getText().trim();
                 if (prompt.isEmpty()) {
@@ -1017,7 +1024,7 @@ public class AITestGeneratorDialog extends JFrame {
                 }
                 appendLog("Mode: Prompt");
                 appendLog("Launching Playwright MCP server (first run may take ~30s to download)...");
-                events = currentAgent.generateFromPrompt(prompt, appUrl);
+                events = currentAgent.generateFromPrompt(prompt, appUrl, existingReusables);
             }
 
             appendLog("Agent started — waiting for response...");
@@ -1102,16 +1109,42 @@ public class AITestGeneratorDialog extends JFrame {
             return;
         }
 
+        // Recovery: if a [REUSABLE] group has >1 test case, the LLM collapsed functional
+        // test cases into the reusable block. Keep only the first TC as reusable and
+        // promote the rest into a new regular scenario so they land in TestPlan, not ReusableComponents.
+        List<AITestGenerationAgent.ScenarioGroup> fixed = new ArrayList<>();
+        for (AITestGenerationAgent.ScenarioGroup g : groups) {
+            if (g.reusable && g.testCases.size() > 1) {
+                appendLog("NOTE: '" + g.scenarioName + "' [REUSABLE] had " + g.testCases.size()
+                        + " test cases - keeping first as reusable, promoting the rest to a regular scenario.");
+                fixed.add(new AITestGenerationAgent.ScenarioGroup(
+                        g.scenarioName,
+                        java.util.Collections.singletonList(g.testCases.get(0)),
+                        true));
+                fixed.add(new AITestGenerationAgent.ScenarioGroup(
+                        g.scenarioName + "_Tests",
+                        g.testCases.subList(1, g.testCases.size()),
+                        false));
+            } else {
+                fixed.add(g);
+            }
+        }
+        groups = fixed;
+
         scenarioGroups.clear();
         scenarioGroups.addAll(groups);
 
         int totalTestCases = groups.stream().mapToInt(g -> g.testCases.size()).sum();
-        appendLog("Generated " + groups.size() + " scenario(s), " + totalTestCases + " test case(s):");
+        long reusableCount = groups.stream().filter(g -> g.reusable).count();
+        appendLog("Generated " + groups.size() + " scenario(s) (" + reusableCount
+                + " reusable), " + totalTestCases + " test case(s):");
         StringBuilder names = new StringBuilder();
         for (AITestGenerationAgent.ScenarioGroup g : groups) {
-            appendLog("  Scenario: " + g.scenarioName + " (" + g.testCases.size() + " test cases)");
+            String label = g.reusable ? " [REUSABLE]" : "";
+            appendLog("  Scenario: " + g.scenarioName + label
+                    + " (" + g.testCases.size() + " test cases)");
             g.testCases.forEach(tc -> appendLog("    • " + tc.name));
-            names.append(g.scenarioName).append("\n");
+            names.append(g.scenarioName).append(label).append("\n");
         }
 
         scenarioCountLabel.setText(groups.size() + " scenario(s), " + totalTestCases
@@ -1149,22 +1182,51 @@ public class AITestGeneratorDialog extends JFrame {
         File recordingDir = new File(projectLocation + File.separator + "Recording");
         recordingDir.mkdirs();
 
+        // Determine the execute-reusable reference from the first reusable scenario.
+        // This is used to prepend "Execute|Login:Login" as step 1 in every regular TC,
+        // mirroring how API tests reference their Auth reusable via "Execute|Auth:Login".
+        String executeReusable = null;
+        for (int i = 0; i < scenarioGroups.size(); i++) {
+            AITestGenerationAgent.ScenarioGroup g = scenarioGroups.get(i);
+            if (g.reusable && !g.testCases.isEmpty()) {
+                String rawR = editedNames[i].trim().replaceAll("(?i)\\s*\\[REUSABLE]\\s*", "").trim();
+                String folder = rawR.replaceAll("[^A-Za-z0-9_\\-]", "_");
+                if (folder.isEmpty()) folder = g.scenarioName;
+                String tcName = g.testCases.get(0).name.replaceAll("[^A-Za-z0-9_\\-]", "_");
+                executeReusable = folder + ":" + tcName;
+                appendLog("Reusable login reference for Execute step: " + executeReusable);
+                break;
+            }
+        }
+
         PlaywrightRecordingParser parser = new PlaywrightRecordingParser(sMainFrame);
         int importedTestCases = 0;
 
         for (int i = 0; i < scenarioGroups.size(); i++) {
             AITestGenerationAgent.ScenarioGroup group = scenarioGroups.get(i);
-            String scenarioFolder = editedNames[i].trim().replaceAll("[^A-Za-z0-9_\\-]", "_");
+
+            // Strip any " [REUSABLE]" label the user may have left in the name field
+            String rawName = editedNames[i].trim().replaceAll("(?i)\\s*\\[REUSABLE]\\s*", "").trim();
+            String scenarioFolder = rawName.replaceAll("[^A-Za-z0-9_\\-]", "_");
             if (scenarioFolder.isEmpty()) scenarioFolder = group.scenarioName;
+
+            if (group.reusable) {
+                appendLog("[REUSABLE] Importing into ReusableComponents: " + scenarioFolder);
+            }
 
             for (AITestGenerationAgent.TestScript tc : group.testCases) {
                 String safeName = tc.name.replaceAll("[^A-Za-z0-9_\\-]", "_");
                 File dest = new File(recordingDir, scenarioFolder + "_" + safeName + ".txt");
                 try {
                     Files.writeString(dest.toPath(), tc.code);
-                    parser.playwrightParser(dest, scenarioFolder, safeName);
+                    // Regular TCs get an Execute step prepended to call the Login reusable,
+                    // matching the API test pattern where step 1 is always Execute|Auth:Login.
+                    String prependExec = (!group.reusable && executeReusable != null) ? executeReusable : null;
+                    parser.playwrightParser(dest, scenarioFolder, safeName, group.reusable, prependExec);
                     importedTestCases++;
-                    appendLog("Imported: " + scenarioFolder + "/" + safeName);
+                    String target = group.reusable ? "ReusableComponents" : "TestPlan";
+                    appendLog("Imported: " + target + "/" + scenarioFolder + "/" + safeName
+                            + (prependExec != null ? " [Execute:" + prependExec + " prepended]" : ""));
                 } catch (IOException ex) {
                     LOG.log(Level.SEVERE, "Failed to import " + scenarioFolder + "/" + safeName, ex);
                     appendLog("ERROR importing " + scenarioFolder + "/" + safeName + ": " + ex.getMessage());
@@ -1188,6 +1250,26 @@ public class AITestGeneratorDialog extends JFrame {
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    /**
+     * Scans the project's ReusableComponents directory for scenario folders created by
+     * previous [REUSABLE] imports. The folder names are returned as-is and passed to the
+     * agent so it does not regenerate login or other shared setups that already exist.
+     *
+     * This mirrors the API test pattern where reusable scenarios live in ReusableComponents/
+     * rather than TestPlan/.
+     */
+    private List<String> detectExistingReusables(String projectLocation) {
+        List<String> names = new ArrayList<>();
+        File reusableDir = new File(projectLocation + File.separator + "ReusableComponents");
+        if (!reusableDir.exists()) return names;
+        File[] subdirs = reusableDir.listFiles(File::isDirectory);
+        if (subdirs == null) return names;
+        for (File dir : subdirs) {
+            names.add(dir.getName());
+        }
+        return names;
+    }
 
     private void appendLog(String text) {
         logArea.append(text);

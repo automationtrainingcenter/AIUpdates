@@ -36,25 +36,86 @@ public class AITestGenerationAgent {
     /**
      * A scenario group: one scenario folder containing multiple individual test cases.
      * Maps to one TestPlan sub-folder in INGenious with N CSV files inside.
+     * Reusable groups (marked [REUSABLE] in LLM output) represent shared setup flows
+     * like login that are referenced by other test cases.
      */
     public static final class ScenarioGroup {
         public final String scenarioName;
         public final List<TestScript> testCases;
+        public final boolean reusable;
         public ScenarioGroup(String scenarioName, List<TestScript> testCases) {
+            this(scenarioName, testCases, false);
+        }
+        public ScenarioGroup(String scenarioName, List<TestScript> testCases, boolean reusable) {
             this.scenarioName = scenarioName;
             this.testCases = testCases;
+            this.reusable = reusable;
         }
     }
 
-    // Concise system prompt — stable content improves prompt caching hit rates.
+    // Concise system prompt - stable content improves prompt caching hit rates.
     private static final String SYSTEM_PROMPT = """
-            You are a browser automation agent. Use browser tools FIRST — never write code from memory.
+            You are a browser automation agent for INGenious Playwright Studio.
 
-            Workflow: browser_navigate → browser_screenshot → browser_click/browser_fill/etc. for every action.
-            After completing ALL browser interactions for a scenario group, output its code block.
+            === TOOLS TO USE - exact parameter names ===
+            browser_navigate : url="https://example.com"
+            browser_snapshot : (no parameters)
+            browser_type     : target="#css-id"  text="value to type"
+            browser_click    : target="#css-id"
 
-            ═══ OUTPUT FORMAT ═══
-            One block per scenario group:
+            Use browser_snapshot after EVERY navigation and after each action to confirm the page state.
+
+            STRICTLY FORBIDDEN - never call these tools under any circumstances:
+            - browser_run_code_unsafe  (always fails with SyntaxError)
+            - browser_fill_form        (always fails with schema validation errors)
+
+            === LOCATOR RULES - critical for correct import ===
+            ONLY use ONE of these two locator forms:
+            1. #id selector:              page.locator("#user-name").fill("value")
+            2. [data-test] selector:      page.locator("[data-test=\\"login-button\\"]").click()
+
+            NEVER use CSS class selectors (.shopping_cart_link, .btn, etc.) - they cause import failures.
+            Always confirm the exact id or data-test attribute from the browser_snapshot before using it.
+
+            === WORKFLOW ===
+            1. browser_navigate to the URL
+            2. browser_snapshot - read the page structure, find #id or data-test attributes
+            3. browser_type / browser_click for each interaction
+            4. browser_snapshot after each major action to confirm navigation/state
+            5. After ALL interactions complete, output ONLY the code blocks below
+
+            === REUSABLE LOGIN ===
+            A [REUSABLE] scenario holds ONLY the shared login/setup steps - EXACTLY 1 test case.
+            Do NOT put functional test cases from the requirement inside [REUSABLE].
+            ALL functional test cases described in the requirement go in a SEPARATE regular scenario (no [REUSABLE] suffix).
+            Functional test cases must NOT include login steps (navigate to login page, fill credentials, click login).
+            An Execute step calling the Login reusable is added automatically at import time - do not duplicate it.
+            Each functional test case starts directly from the first action that requires an already-logged-in session.
+            Do NOT use Java Runnable, lambda, method references, or helper variables - only page.* calls.
+
+            === OUTPUT FORMAT ===
+            Step 1 - Reusable scenario (output FIRST, contains ONLY login steps):
+
+            =====SCENARIO_START: Login [REUSABLE]=====
+            import com.microsoft.playwright.*;
+            import static com.microsoft.playwright.assertions.PlaywrightAssertions.assertThat;
+            public class GeneratedTest {
+                public static void main(String[] args) {
+                    try (Playwright playwright = Playwright.create()) {
+                        Browser browser = playwright.chromium().launch();
+                        BrowserContext context = browser.newContext();
+                        Page page = context.newPage();
+                        // --- Test Case 1: Login ---
+                        page.navigate("https://example.com");
+                        page.locator("#username").fill("user");
+                        page.locator("#password").fill("pass");
+                        page.locator("#login-button").click();
+                    }
+                }
+            }
+            =====SCENARIO_END=====
+
+            Step 2 - Regular scenario (functional test cases only - NO login steps):
 
             =====SCENARIO_START: <scenario name>=====
             import com.microsoft.playwright.*;
@@ -66,23 +127,21 @@ public class AITestGenerationAgent {
                         BrowserContext context = browser.newContext();
                         Page page = context.newPage();
                         // --- Test Case 1: <name> ---
-                        page.navigate("...");
-                        // browser actions and assertions
-                        // --- Test Case 2: <name> ---
-                        page.navigate("...");
-                        // browser actions and assertions
+                        // Start directly from the post-login action (NO login steps here)
+                        page.navigate("https://example.com/target-page");
+                        page.locator("#id").click();
                     }
                 }
             }
             =====SCENARIO_END=====
 
-            Rules:
-            - Group related test flows; each test case starts with page.navigate().
-            - Generate 2–3 scenario groups, each with 2–5 test cases.
-            - Assertions: ONLY assertThat(locator).isVisible() | .containsText("") | .hasValue("")
-            - FORBIDDEN: expect() .toBeVisible() .toHaveText() .toHaveValue() waitForSelector()
-            - Locators: any standard Playwright locator seen in the browser.
-            - No markdown, no text outside the scenario blocks.
+            === RULES ===
+            - [REUSABLE] scenario: contains ONLY the login test case. Never contains functional test cases.
+            - Regular scenario: contains ONLY the functional test cases described in the requirement.
+            - For a single described flow: 1 regular scenario with 1 test case.
+            - ONLY page.navigate(), page.locator("#id").fill(), page.locator("#id").click() - NO other Java
+            - Assertions: ONLY assertThat(page.locator("#id")).isVisible() | .containsText("") | .hasValue("")
+            - No markdown, no explanations, no text outside the scenario blocks
             """;
 
     private final String openRouterKey;
@@ -96,7 +155,8 @@ public class AITestGenerationAgent {
         this.npxCommand = npxCommand;
     }
 
-    public Flowable<Event> generateFromPrompt(String prompt, String appUrl) throws Exception {
+    public Flowable<Event> generateFromPrompt(String prompt, String appUrl,
+                                               List<String> existingReusables) throws Exception {
         McpToolset playwrightMcp = buildPlaywrightMcp();
         LlmAgent agent = LlmAgent.builder()
                 .name("ingenious_prompt_generator")
@@ -108,10 +168,11 @@ public class AITestGenerationAgent {
 
         String userMessage = "Navigate to: " + appUrl
                 + "\n\nRequirement:\n" + prompt
-                + "\n\nOrganise into 2–3 SCENARIO GROUPS (e.g. valid flows, invalid flows, edge cases)."
-                + " For each group: use browser tools to run all test cases, then output the"
+                + "\n\nGenerate EXACTLY the number of test cases described. For a single described flow, output 1 scenario with 1 test case."
+                + " For each scenario: use browser tools to execute all steps, then output the"
                 + " =====SCENARIO_START/END===== block with each test case separated by // --- Test Case N: name --- comments."
-                + " Each test case starts with page.navigate().";
+                + " Each test case starts with page.navigate()."
+                + buildExistingReusablesNote(existingReusables);
         Content content = Content.fromParts(Part.fromText(userMessage));
         return runner.runAsync("user", "session-" + System.currentTimeMillis(),
                 content, RunConfig.builder().autoCreateSession(true).build())
@@ -120,7 +181,7 @@ public class AITestGenerationAgent {
 
     public Flowable<Event> generateFromAzure(
             String azureUrl, String azurePat, String azureProject,
-            String testPlanId, String appUrl) throws Exception {
+            String testPlanId, String appUrl, List<String> existingReusables) throws Exception {
 
         McpToolset playwrightMcp = buildPlaywrightMcp();
         McpToolset azureMcp = buildAzureMcp(azureUrl, azurePat, azureProject);
@@ -137,11 +198,30 @@ public class AITestGenerationAgent {
                 + "\n\nGroup Azure test cases into scenario groups by area/category."
                 + " For each group: use browser tools to execute each test case, then output the"
                 + " =====SCENARIO_START/END===== block with each test case separated by // --- Test Case N: name --- comments."
-                + " Each test case starts with page.navigate(). Do not skip any Azure test cases.";
+                + " Each test case starts with page.navigate(). Do not skip any Azure test cases."
+                + buildExistingReusablesNote(existingReusables);
         Content content = Content.fromParts(Part.fromText(userMessage));
         return runner.runAsync("user", "session-" + System.currentTimeMillis(),
                 content, RunConfig.builder().autoCreateSession(true).build())
                 .subscribeOn(Schedulers.io());
+    }
+
+    /**
+     * Builds the "existing reusables" note appended to the user message.
+     *
+     * When the project already contains reusable scenarios (e.g. Login was generated
+     * in a previous run), the agent must NOT regenerate them. Instead it should
+     * perform login/setup for browser exploration but omit those steps from the output,
+     * starting each new test case at the post-login URL directly.
+     */
+    private static String buildExistingReusablesNote(List<String> existingReusables) {
+        if (existingReusables == null || existingReusables.isEmpty()) return "";
+        String names = String.join(", ", existingReusables);
+        return "\n\nIMPORTANT - these reusable scenarios already exist in the project: " + names + "."
+                + " Do NOT output a [REUSABLE] scenario block for any of them."
+                + " You may still navigate and perform login/setup steps in the BROWSER during exploration,"
+                + " but do NOT include those steps in the generated code."
+                + " Each new test case must start with page.navigate() to the post-login or feature URL directly.";
     }
 
     public void cancel() {
@@ -169,7 +249,10 @@ public class AITestGenerationAgent {
                 Pattern.DOTALL);
         Matcher m = p.matcher(rawOutput);
         while (m.find()) {
-            String scenarioName = sanitizeName(m.group(1).trim());
+            String rawName = m.group(1).trim();
+            boolean reusable = rawName.toUpperCase().contains("[REUSABLE]");
+            String scenarioName = sanitizeName(
+                    rawName.replaceAll("(?i)\\s*\\[REUSABLE]\\s*", "").trim());
             String block = m.group(2).trim();
             int start = block.indexOf("import com.microsoft.playwright.*;");
             if (start == -1) continue;
@@ -178,10 +261,10 @@ public class AITestGenerationAgent {
             if (fence != -1) code = code.substring(0, fence).trim();
 
             List<TestScript> testCases = splitIntoTestCases(code);
-            groups.add(new ScenarioGroup(scenarioName, testCases));
+            groups.add(new ScenarioGroup(scenarioName, testCases, reusable));
         }
 
-        // Fallback: no SCENARIO delimiters — treat each old TESTCASE block or whole output as a single-TC scenario
+        // Fallback: no SCENARIO delimiters - treat each old TESTCASE block or whole output as a single-TC scenario
         if (groups.isEmpty()) {
             List<TestScript> scripts = extractMultipleScripts(rawOutput);
             for (TestScript s : scripts) {
@@ -227,42 +310,41 @@ public class AITestGenerationAgent {
             cases.add(new TestScript(sanitizeName(currentName), wrapInPlaywrightClass(currentBody)));
         }
 
-        // No markers — treat whole scenario as a single test case
+        // No markers - treat whole scenario as a single test case
         if (cases.isEmpty()) {
             List<String> allLines = Arrays.stream(scenarioCode.split("\n"))
                     .map(String::trim)
                     .filter(AITestGenerationAgent::isParserCompatibleLine)
                     .collect(Collectors.toList());
-            cases.add(new TestScript("TestCase_1", wrapInPlaywrightClass(allLines)));
+            // Only create a test case if there are actual page.* steps to import.
+            // An empty body would produce a Refactor_Object row with no element info.
+            if (!allLines.isEmpty()) {
+                cases.add(new TestScript("TestCase_1", wrapInPlaywrightClass(allLines)));
+            }
         }
         return cases;
     }
 
     /**
      * Returns true only for lines the PlaywrightRecordingParser can handle.
-     * Filters out: blank lines, Java scaffolding, comments, assertions,
-     * screenshots, and non-page browser calls — all of which cause Refactor_Object.
+     *
+     * Only page.navigate(), page.locator(...).fill(), and page.locator(...).click()
+     * are understood by the parser. Everything else - Java scaffolding, comments,
+     * assertions, helper variable calls like login.run(), Runnable declarations,
+     * browser. *context.* calls - causes Refactor_Object if passed through.
+     *
+     * Additionally, page.screenshot() is excluded because the parser has no
+     * "screenshot" action mapping.
      */
     private static boolean isParserCompatibleLine(String t) {
         if (t.isEmpty()) return false;
-        // Java class/method scaffolding
-        if (t.startsWith("import ")) return false;
-        if (t.startsWith("public class ")) return false;
-        if (t.startsWith("public static void main")) return false;
-        if (t.startsWith("try (Playwright")) return false;
-        if (t.startsWith("Browser ")) return false;
-        if (t.startsWith("BrowserContext ")) return false;
-        if (t.startsWith("Page ")) return false;
-        if (t.equals("{") || t.equals("}")) return false;
-        // Comments → Refactor_Object in parser
-        if (t.startsWith("//")) return false;
-        // Assertions → not understood by parser → Refactor_Object
-        if (t.startsWith("assertThat")) return false;
-        // Screenshots → parser doesn't know "screenshot" action → Refactor_Object
+        if (!t.startsWith("page.")) return false;
+        // page.screenshot() has no parser mapping - causes Refactor_Object
         if (t.startsWith("page.screenshot")) return false;
-        // browser.close() and other browser-level calls → processed after playwrightSteps≥1 → Refactor_Object
-        if (t.startsWith("browser.")) return false;
-        if (t.startsWith("context.")) return false;
+        // Chained locators (.first(), .last(), .nth(), .filter()) can't be resolved
+        // by PlaywrightRecordingParser's locator extraction - would produce Refactor_Object
+        if (t.contains(").first()") || t.contains(").last()")
+                || t.contains(").nth(") || t.contains(").filter(")) return false;
         return true;
     }
 

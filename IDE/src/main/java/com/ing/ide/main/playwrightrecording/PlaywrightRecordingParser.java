@@ -88,13 +88,44 @@ public class PlaywrightRecordingParser {
      * @param testCaseName    the CSV file name for this test case (e.g. "TC1_Admin_Login")
      */
     public void playwrightParser(File file, String scenarioFolder, String testCaseName) {
+        playwrightParser(file, scenarioFolder, testCaseName, false);
+    }
+
+    /**
+     * Parses a recording into a named scenario folder, routing to either TestPlan or
+     * ReusableComponents depending on the {@code reusable} flag.
+     *
+     * Reusable scenarios (e.g. Login) go to ReusableComponents/ so INGenious lists
+     * them as shared library components, mirroring the API test reusable pattern.
+     *
+     * @param file            the Playwright Java recording file to parse
+     * @param scenarioFolder  the scenario folder name (no path prefix)
+     * @param testCaseName    the CSV file name for this test case
+     * @param reusable        true  -> ReusableComponents/{scenarioFolder}/
+     *                        false -> TestPlan/{scenarioFolder}/
+     */
+    public void playwrightParser(File file, String scenarioFolder, String testCaseName, boolean reusable) {
+        playwrightParser(file, scenarioFolder, testCaseName, reusable, null);
+    }
+
+    /**
+     * Like {@link #playwrightParser(File, String, String, boolean)} but prepends an
+     * Execute step as step 1 before the generated steps.  Used for regular (non-reusable)
+     * test cases that should call the Login reusable component instead of inlining login.
+     *
+     * @param executeReusable  "ScenarioName:TestCaseName" for the Execute row (e.g. "Login:Login"),
+     *                         or {@code null} to skip prepending.
+     */
+    public void playwrightParser(File file, String scenarioFolder, String testCaseName,
+                                 boolean reusable, String executeReusable) {
         if (file == null || !file.exists()) return;
         try {
             filePath.put("projectPath", sMainFrame.getProject().getLocation());
             filePath.put("importPlaywrightRecordingFilePath", file.getAbsolutePath());
             testCase.put("fileName", StringUtils.capitalize(testCaseName));
             testCase.put("pageName", testCase.get("fileName"));
-            String testScenarioName = (filePath.get("projectPath") + "/TestPlan/" + scenarioFolder)
+            String baseFolder = reusable ? "ReusableComponents" : "TestPlan";
+            String testScenarioName = (filePath.get("projectPath") + "/" + baseFolder + "/" + scenarioFolder)
                     .replace("\\", "/");
             testCase.put("testScenarioName", testScenarioName);
             File testScenario = new File(testScenarioName);
@@ -111,7 +142,7 @@ public class PlaywrightRecordingParser {
             testCase.put("pageName", pageName);
             WebORPage page = webOR.addPage(pageName);
             List<String> lines = readFileInList(filePath.get("importPlaywrightRecordingFilePath"));
-            executeParse(lines.iterator(), page, testScenarioName);
+            executeParse(lines.iterator(), page, testScenarioName, executeReusable);
             page.getRoot().getObjectRepository().saveWebPageNow(page);
         } catch (Exception ex) {
             Logger.getLogger(PlaywrightRecordingParser.class.getName()).log(Level.SEVERE, null, ex);
@@ -119,12 +150,24 @@ public class PlaywrightRecordingParser {
     }
 
     private void executeParse(Iterator<String> iterator, WebORPage page, String testScenarioName) {
+        executeParse(iterator, page, testScenarioName, null);
+    }
+
+    private void executeParse(Iterator<String> iterator, WebORPage page, String testScenarioName,
+                              String prependExecute) {
         StringBuilder stepBuilder = new StringBuilder();
         testCaseParameter();
         attributeDeclaration();
-        int stepNumber = 1;
-        int playwrightSteps = 0;
         stepBuilder.append("Step,ObjectName,Description,Action,Input,Condition,Reference\n");
+        // Prepend Execute step so the test case calls the reusable Login component first
+        int stepNumber;
+        if (prependExecute != null && !prependExecute.isBlank()) {
+            stepBuilder.append("1,Execute,,").append(prependExecute).append(",,,\n");
+            stepNumber = 2;
+        } else {
+            stepNumber = 1;
+        }
+        int playwrightSteps = 0;
         while (iterator.hasNext()) {
             attributeDeclaration();
             testCaseParameter();
